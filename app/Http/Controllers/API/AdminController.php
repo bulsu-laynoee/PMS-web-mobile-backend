@@ -307,6 +307,7 @@ class AdminController extends BaseController
             'username' => 'required|string',
             'email' => 'required|email|unique:users,email',
             'password' => 'required|min:6',
+            'contact_number' => ['nullable','string', Rule::unique('user_details','contact_number')],
         ]);
 
         if ($v->fails()) return $this->sendError('Validation error', $v->errors());
@@ -324,6 +325,7 @@ class AdminController extends BaseController
             'user_id' => $user->id,
             'firstname' => $request->username,
             'lastname' => '',
+            'contact_number' => $request->contact_number ?? null,
             'from_pending' => true,
             'membership_date' => $user->created_at,
         ]);

@@ -43,6 +43,8 @@ class UsersController extends BaseController
 
     public function show(User $user)
     {
+        // Ensure userDetail relation is loaded so callers receive contact_number and related fields
+        $user = $user->load('userDetail');
         return $this->sendResponse($user, "User retrieved successfully.");
     }
 
@@ -201,5 +203,27 @@ class UsersController extends BaseController
         });
 
         return $this->sendResponse($users, 'Users with vehicles retrieved');
+    }
+
+    /**
+     * Return users for a specific role id. Used by mobile to fetch Admin/Guard contacts.
+     */
+    public function byRole($roleId)
+    {
+        $users = User::with('userDetail', 'role')
+            ->where('roles_id', $roleId)
+            ->get()
+            ->map(function($u) {
+                $ud = $u->userDetail;
+                return [
+                    'id' => $u->id,
+                    'name' => $u->name,
+                    'email' => $u->email,
+                    'role' => $u->role ? $u->role->name : null,
+                    'contact_number' => $ud->contact_number ?? null
+                ];
+            });
+
+        return $this->sendResponse($users, "Users with role {$roleId} retrieved");
     }
 }

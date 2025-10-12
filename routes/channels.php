@@ -16,3 +16,10 @@ use Illuminate\Support\Facades\Broadcast;
 Broadcast::channel('App.Models.User.{id}', function ($user, $id) {
     return (int) $user->id === (int) $id;
 });
+
+Broadcast::channel('conversation.{id}', function ($user, $id) {
+    // only allow conversation participants
+    return \App\Models\Conversation::where('id', $id)->whereHas('users', function($q) use ($user) {
+        $q->where('user_id', $user->id);
+    })->exists();
+});

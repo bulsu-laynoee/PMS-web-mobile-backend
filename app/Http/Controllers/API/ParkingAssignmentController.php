@@ -9,6 +9,8 @@ use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
+use App\Notifications\ParkingAssignedNotification;
+use App\Events\ParkingSlotStatusChanged;
 class ParkingAssignmentController extends Controller
 {
     // Get all assignments for a given layout (for frontend search/filter)
@@ -152,6 +154,48 @@ class ParkingAssignmentController extends Controller
             $slot->update(['space_status' => $slotStatus]);
 
             DB::commit();
+
+            // send notification to user if user exists
+            try {
+                if ($assignment->user_id) {
+                    $u = User::find($assignment->user_id);
+                    if ($u && method_exists($u, 'notify')) {
+                        // Prefer the Laravel notification system when available
+                        try {
+                            $u->notify(new ParkingAssignedNotification($assignment->load(['parkingSlot', 'user'])));
+                        } catch (\Exception $e) {
+                            // If notifications table uses legacy schema, insert directly
+                            try {
+                                if (!\Illuminate\Support\Facades\Schema::hasColumn('notifications', 'notifiable_type')) {
+                                    \Illuminate\Support\Facades\DB::table('notifications')->insert([
+                                        'user_id' => $u->id,
+                                        'type' => 'parking_assigned',
+                                        'message' => 'A parking slot has been assigned to you',
+                                        'link' => null,
+                                        'read' => 0,
+                                        'created_at' => now(),
+                                        'updated_at' => now(),
+                                    ]);
+                                } else {
+                                    throw $e; // rethrow so outer catch logs it
+                                }
+                            } catch (\Exception $e2) {
+                                \Log::warning('ParkingAssignedNotification fallback insert failed: ' . $e2->getMessage());
+                            }
+                        }
+                    }
+                }
+            } catch (\Exception $e) {
+                // non-fatal: log and continue
+                \Log::warning('Failed to send parking assigned notification: ' . $e->getMessage());
+            }
+
+            // dispatch a broadcast event for clients listening to slot changes
+            try {
+                event(new ParkingSlotStatusChanged($assignment->load(['parkingSlot', 'user'])));
+            } catch (\Exception $e) {
+                \Log::warning('Failed to dispatch ParkingSlotStatusChanged event: ' . $e->getMessage());
+            }
 
             return response()->json([
                 'message' => 'Parking assignment created successfully',
@@ -318,6 +362,51 @@ class ParkingAssignmentController extends Controller
                 'message' => 'Error ending parking assignment',
                 'error' => $e->getMessage()
             ], 500);
+        }
+    }
+
+    /**
+     * End an active assignment by vehicle plate or user id.
+     * POST /api/parking-assignments/end-by-vehicle
+     * Body: { user_id?: int, vehicle_plate?: string, parking_slot_id?: int }
+     */
+    public function endByVehicle(Request $request)
+    {
+        $request->validate([
+            'user_id' => 'nullable|exists:users,id',
+            'vehicle_plate' => 'nullable|string',
+            'parking_slot_id' => 'nullable|exists:parking_slots,id',
+        ]);
+
+        try {
+            // Prefer parking_slot_id if provided
+            $assignment = null;
+            if ($request->filled('parking_slot_id')) {
+                $assignment = ParkingAssignment::where('parking_slot_id', $request->parking_slot_id)
+                    ->where('status', 'active')
+                    ->first();
+            }
+
+            if (!$assignment && $request->filled('vehicle_plate')) {
+                $assignment = ParkingAssignment::where('vehicle_plate', $request->vehicle_plate)
+                    ->where('status', 'active')
+                    ->first();
+            }
+
+            if (!$assignment && $request->filled('user_id')) {
+                $assignment = ParkingAssignment::where('user_id', $request->user_id)
+                    ->where('status', 'active')
+                    ->first();
+            }
+
+            if (!$assignment) {
+                return response()->json(['message' => 'Active assignment not found for provided identifiers'], 404);
+            }
+
+            // Reuse the existing endAssignment behaviour
+            return $this->endAssignment($assignment);
+        } catch (\Exception $e) {
+            return response()->json(['message' => 'Error ending assignment', 'error' => $e->getMessage()], 500);
         }
     }
 }

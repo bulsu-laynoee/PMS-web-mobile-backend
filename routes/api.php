@@ -29,6 +29,10 @@ use App\Http\Controllers\FileController;
 
 // Public routes for serving images
 Route::get('image/{path}', [FileController::class, 'serveImage'])->where('path', '.*');
+// Public route for incident attachments
+Route::get('incident-attachments/{path}', [FileController::class, 'serveImage'])->where('path', '.*');
+// QR verification endpoint used by mobile guard scanner
+Route::post('verify-qr', [App\Http\Controllers\API\QRController::class, 'verify']);
 
 Route::middleware('auth:sanctum')->get('/user', function (Request $request) {
     return $request->user();
@@ -68,6 +72,8 @@ Route::middleware('auth:sanctum')->group( function () {
     Route::resource('products', ProductController::class);
     Route::resource('transactions', TransactionController::class);
     Route::resource('stores', StoreController::class);
+        // QR generation for a user (admin or auth-required)
+        Route::post('users/{id}/qr', [App\Http\Controllers\API\QRController::class, 'generate']);
     Route::prefix('parking-layouts')->group(function() {
         Route::get('/', [ParkingLayoutController::class, 'index']);
         Route::post('/', [ParkingLayoutController::class, 'store']);
@@ -79,6 +85,8 @@ Route::middleware('auth:sanctum')->group( function () {
     // Parking Assignments
     Route::prefix('parking-assignments')->group(function() {
         Route::get('active', [ParkingAssignmentController::class, 'active']);
+        // End assignment by vehicle/user/slot (used by guard exit scanner)
+        Route::post('end-by-vehicle', [ParkingAssignmentController::class, 'endByVehicle']);
         Route::post('{assignment}/switch-parking', [ParkingAssignmentController::class, 'switchParking']);
         Route::post('{assignment}/end', [ParkingAssignmentController::class, 'endAssignment']);
     });
@@ -87,6 +95,8 @@ Route::middleware('auth:sanctum')->group( function () {
     Route::resource('parking-assignments', ParkingAssignmentController::class);
     // Return users along with their user_details and registered vehicles for frontend autoload
     Route::get('users-with-vehicles', [App\Http\Controllers\API\UsersController::class, 'usersWithVehicles']);
+    // Fetch users by role id (mobile will use this to load Admin and Guard contacts)
+    Route::get('users/role/{roleId}', [App\Http\Controllers\API\UsersController::class, 'byRole']);
     
     // Route::resource('trees', TreeController::class);
     Route::get('/trees', [TreeController::class, 'index']);
@@ -109,4 +119,22 @@ Route::middleware('auth:sanctum')->group( function () {
     Route::get('vehicles/{vehicle}', [App\Http\Controllers\API\VehiclesController::class, 'show']);
     Route::put('vehicles/{vehicle}', [App\Http\Controllers\API\VehiclesController::class, 'update']);
     Route::delete('vehicles/{vehicle}', [App\Http\Controllers\API\VehiclesController::class, 'destroy']);
+    // Incidents resource
+    Route::resource('incidents', App\Http\Controllers\API\IncidentsController::class)->only(['index','store','show','update']);
+    // Notifications API used by mobile app
+    Route::get('notifications', [App\Http\Controllers\API\NotificationsController::class, 'index']);
+    Route::post('notifications/{id}/mark-read', [App\Http\Controllers\API\NotificationsController::class, 'markRead']);
+    // Messages logging (sent via mobile or admin)
+    Route::post('messages', [App\Http\Controllers\API\MessagesController::class, 'store']);
+    
+    // QR generation endpoint (generate QR for a user)
+    Route::post('users/{id}/qr', [App\Http\Controllers\API\QRController::class, 'generate']);
+    // Conversations / in-app messaging
+    Route::get('conversations', [App\Http\Controllers\API\ConversationsController::class, 'index']);
+    Route::post('conversations', [App\Http\Controllers\API\ConversationsController::class, 'store']);
+    Route::get('conversations/{id}', [App\Http\Controllers\API\ConversationsController::class, 'show']);
+    Route::post('conversations/{id}/message', [App\Http\Controllers\API\ConversationsController::class, 'message']);
 });
+
+// Optional public endpoint to serve saved QR files directly (from storage/public/qr)
+Route::get('qr/{filename}', [App\Http\Controllers\API\QRController::class, 'showFile'])->where('filename', '.*');

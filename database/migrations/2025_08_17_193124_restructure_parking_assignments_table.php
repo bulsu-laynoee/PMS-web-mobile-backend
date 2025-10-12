@@ -15,7 +15,11 @@ return new class extends Migration
 
         Schema::create('parking_assignments', function (Blueprint $table) {
             $table->id();
-            $table->foreignId('parking_slot_id')->constrained('parking_slots')->onDelete('cascade');
+            // create the column as unsignedBigInteger and index it here. The explicit
+            // foreign key constraint is added later by `2025_09_21_210000_add_foreign_keys_to_pms_tables.php`
+            // This prevents migration ordering issues when parking_slots doesn't exist yet.
+            $table->unsignedBigInteger('parking_slot_id');
+            $table->index('parking_slot_id');
             // define user_id as unsignedBigInteger nullable and index it instead of forcing a FK constraint
             // Some environments may fail to create this FK during migrations; keep it nullable and indexed.
             $table->unsignedBigInteger('user_id')->nullable()->index();

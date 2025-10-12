@@ -2,7 +2,6 @@
    
 namespace App\Http\Controllers\API;
    
-use App\Models\TeamUser;
 use App\Models\UserDetails;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
@@ -128,26 +127,15 @@ class RegisterController extends BaseController
             Vehicle::create($vehicleData);
         }
 
-        $team = $user->myTeam()->create([
-            'user_id' => $user->id,
-            'name' => $user->name . "'s TEAM",
-            'personal_team' => 1,
-        ]);
-
-        $team->team_user()->update([
-            'user_id' => $user->id,
-            'created_at' => Carbon::now()
-        ]);
-        
-        if (!is_null($input['referred_by'])) {
+        // NOTE: the Team model and team_user pivot are unused in the current
+        // application. Avoid creating a personal team during registration.
+        // Keep referral counter handling if provided.
+        if (!empty($input['referred_by'])) {
             $referrer = User::where('email', $input['referred_by'])->first();
-            $referrer->refer_count = $referrer->refer_count + 1;
-            $referrer->save();
-
-            $team->team_user()->update([
-                'user_id' => $user->id,
-                'lead_id' => $referrer->id,
-            ]);
+            if ($referrer) {
+                $referrer->refer_count = $referrer->refer_count + 1;
+                $referrer->save();
+            }
         }
    
         return $this->sendResponse($success, 'User register successfully.');
