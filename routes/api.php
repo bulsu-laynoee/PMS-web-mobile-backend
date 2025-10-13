@@ -15,6 +15,7 @@ Route::get('parking-assignments/by-layout/{layoutId}', [App\Http\Controllers\API
 use App\Http\Controllers\API\ParkingLayoutController;
 use App\Http\Controllers\API\ParkingAssignmentController;
 use App\Http\Controllers\FileController;
+use App\Http\Controllers\API\DatabaseTestController;
 
 /*
 |--------------------------------------------------------------------------
@@ -33,6 +34,10 @@ Route::get('image/{path}', [FileController::class, 'serveImage'])->where('path',
 Route::get('incident-attachments/{path}', [FileController::class, 'serveImage'])->where('path', '.*');
 // QR verification endpoint used by mobile guard scanner
 Route::post('verify-qr', [App\Http\Controllers\API\QRController::class, 'verify']);
+
+// Smoke test endpoints to verify hosted database connection
+Route::get('test/database', [DatabaseTestController::class, 'testConnection']);
+Route::get('test/health', [DatabaseTestController::class, 'healthCheck']);
 
 Route::middleware('auth:sanctum')->get('/user', function (Request $request) {
     return $request->user();
