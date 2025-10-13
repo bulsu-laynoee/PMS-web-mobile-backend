@@ -14,8 +14,18 @@ class Authenticate extends Middleware
      */
     protected function redirectTo($request)
     {
-        if (! $request->expectsJson()) {
+        // For API requests or if no login route exists, return null
+        // This will cause a 401 Unauthorized response instead of redirect
+        if ($request->expectsJson() || !$request->is('web/*')) {
+            return null;
+        }
+        
+        // For web requests, check if login route exists
+        try {
             return route('login');
+        } catch (\Exception $e) {
+            // If login route doesn't exist, return null for 401 response
+            return null;
         }
     }
 }
