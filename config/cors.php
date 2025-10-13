@@ -16,7 +16,9 @@ return [
 
     'allowed_methods' => ['*'],
 
-    'allowed_origins' => ['*'],
+    'allowed_origins' => env('APP_ENV') === 'production' 
+        ? explode(',', env('CORS_ALLOWED_ORIGINS', 'https://bulsupms.com'))
+        : ['*'],
 
     'allowed_origins_patterns' => [],
 

@@ -138,3 +138,7 @@ Route::middleware('auth:sanctum')->group( function () {
 
 // Optional public endpoint to serve saved QR files directly (from storage/public/qr)
 Route::get('qr/{filename}', [App\Http\Controllers\API\QRController::class, 'showFile'])->where('filename', '.*');
+
+// Fallback routes for file serving (in case storage:link fails on shared hosting)
+Route::get('storage/{path}', [App\Http\Controllers\API\FileStorageController::class, 'serveFile'])->where('path', '.*');
+Route::get('check-storage-link', [App\Http\Controllers\API\FileStorageController::class, 'checkStorageLink']);

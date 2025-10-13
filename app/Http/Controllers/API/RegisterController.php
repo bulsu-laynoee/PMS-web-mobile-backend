@@ -28,6 +28,7 @@ class RegisterController extends BaseController
             'email' => 'required|email|unique:users,email',
             'password' => 'required',
             'c_password' => 'required|same:password',
+            'role_id' => 'nullable|integer|exists:roles,id',
             // vehicle / OR-CR uploads
             'plate_number' => 'nullable|string',
             'vehicle_color' => 'nullable|string',
@@ -39,6 +40,8 @@ class RegisterController extends BaseController
             'or_cr_pdf' => 'sometimes|file|mimes:pdf|max:5120',
             'or_number' => 'nullable|string|unique:vehicles,or_number',
             'cr_number' => 'nullable|string|unique:vehicles,cr_number',
+            'mark_as_pending' => 'nullable|string',
+            'is_second_hand' => 'nullable|string',
             'referred_by' => [
                 'nullable', 
                 'email', 
@@ -59,12 +62,17 @@ class RegisterController extends BaseController
         $new_user = [
             'name' => $input['firstname'] . " " . $input['lastname'],
             'email' => $input['email'],
-            'password' => $input['password']
+            'password' => $input['password'],
+            'role_id' => $input['role_id'] ?? 3, // Default to student role if not specified
         ];
         $user = User::create($new_user);
         $success['token'] =  $user->createToken('MyApp')->plainTextToken;
         $success['name'] =  $user->name;
-        $user->userDetail()->save(UserDetails::create([
+        
+        // Determine if account should be marked as pending
+        $markAsPending = !empty($input['mark_as_pending']) || !empty($input['is_second_hand']);
+        
+        $userDetails = UserDetails::create([
             'user_id' => $user->id,
             'firstname' => $input['firstname'],
             'lastname' => $input['lastname'],
@@ -76,26 +84,53 @@ class RegisterController extends BaseController
             'or_number' => $input['or_number'] ?? null,
             'cr_number' => $input['cr_number'] ?? null,
             'plate_number' => $input['plate_number'] ?? null,
-        ]));
+            'from_pending' => $markAsPending ? 1 : 0,
+        ]);
+        
+        $user->userDetail()->save($userDetails);
+        
+        \Log::info('User registration created', [
+            'user_id' => $user->id,
+            'from_pending' => $userDetails->from_pending,
+            'mark_as_pending_flag' => $input['mark_as_pending'] ?? null,
+            'is_second_hand_flag' => $input['is_second_hand'] ?? null
+        ]);
 
         // Handle vehicle OR/CR upload and vehicle creation if plate_number supplied
         $orPath = null; $crPath = null;
-        if (isset($input['or_file']) || isset($input['cr_file']) || isset($input['or_cr_pdf'])) {
-            // Note: incoming files are in the request, so access via $request
+        
+        // Debug: Log what files are being received
+        \Log::info('Registration file upload debug', [
+            'has_or_file' => $request->hasFile('or_file'),
+            'has_cr_file' => $request->hasFile('cr_file'),
+            'has_or_cr_pdf' => $request->hasFile('or_cr_pdf'),
+            'all_files' => array_keys($request->allFiles()),
+            'input_keys' => array_keys($input)
+        ]);
+        
+        if ($request->hasFile('or_file') || $request->hasFile('cr_file') || $request->hasFile('or_cr_pdf')) {
+            // Ensure storage directory exists
+            if (!file_exists(storage_path('app/public/or_cr'))) {
+                mkdir(storage_path('app/public/or_cr'), 0755, true);
+            }
+            
             if ($request->hasFile('or_cr_pdf')) {
                 $file = $request->file('or_cr_pdf');
                 $filename = 'orcr_' . Str::random(8) . '.' . $file->getClientOriginalExtension();
                 $orPath = $file->storeAs('or_cr', $filename, 'public');
+                \Log::info('Uploaded OR/CR PDF', ['path' => $orPath, 'filename' => $filename]);
             }
             if ($request->hasFile('or_file')) {
                 $file = $request->file('or_file');
                 $filename = 'or_' . Str::random(8) . '.' . $file->getClientOriginalExtension();
                 $orPath = $file->storeAs('or_cr', $filename, 'public');
+                \Log::info('Uploaded OR file', ['path' => $orPath, 'filename' => $filename]);
             }
             if ($request->hasFile('cr_file')) {
                 $file = $request->file('cr_file');
                 $filename = 'cr_' . Str::random(8) . '.' . $file->getClientOriginalExtension();
                 $crPath = $file->storeAs('or_cr', $filename, 'public');
+                \Log::info('Uploaded CR file', ['path' => $crPath, 'filename' => $filename]);
             }
 
             // update the userDetails with or/cr paths
@@ -124,7 +159,18 @@ class RegisterController extends BaseController
                 'or_number' => $input['or_number'] ?? null,
                 'cr_number' => $input['cr_number'] ?? null,
             ];
-            Vehicle::create($vehicleData);
+            
+            \Log::info('Creating vehicle with paths', [
+                'user_id' => $user->id,
+                'plate_number' => $input['plate_number'],
+                'or_path' => $orPath,
+                'cr_path' => $crPath,
+                'or_number' => $input['or_number'] ?? null,
+                'cr_number' => $input['cr_number'] ?? null
+            ]);
+            
+            $vehicle = Vehicle::create($vehicleData);
+            \Log::info('Vehicle created successfully', ['vehicle_id' => $vehicle->id]);
         }
 
         // NOTE: the Team model and team_user pivot are unused in the current
@@ -138,7 +184,16 @@ class RegisterController extends BaseController
             }
         }
    
-        return $this->sendResponse($success, 'User register successfully.');
+        // Include user details in response so mobile app can check from_pending status
+        $success['user'] = [
+            'id' => $user->id,
+            'name' => $user->name,
+            'email' => $user->email,
+            'userDetail' => $user->userDetail()->first()
+        ];
+        
+        $message = $markAsPending ? 'User registered - pending review' : 'User register successfully.';
+        return $this->sendResponse($success, $message);
     }
    
     /**
