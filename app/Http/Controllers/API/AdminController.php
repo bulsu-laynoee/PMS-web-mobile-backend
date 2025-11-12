@@ -326,7 +326,7 @@ class AdminController extends BaseController
             'firstname' => $request->username,
             'lastname' => '',
             'contact_number' => $request->contact_number ?? null,
-            'from_pending' => true,
+            'from_pending' => false,
             'membership_date' => $user->created_at,
         ]);
 

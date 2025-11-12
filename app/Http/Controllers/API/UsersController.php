@@ -226,4 +226,34 @@ class UsersController extends BaseController
 
         return $this->sendResponse($users, "Users with role {$roleId} retrieved");
     }
+
+    /**
+     * Delete a user and related details/vehicles.
+     */
+    public function destroy(User $user)
+    {
+        try {
+            DB::transaction(function() use ($user) {
+                // Delete related user details if present
+                if ($user->userDetail) {
+                    $user->userDetail()->delete();
+                }
+
+                // Delete vehicles and parking assignments if any
+                if (method_exists($user, 'vehicles')) {
+                    $user->vehicles()->delete();
+                }
+
+                if (method_exists($user, 'parkingAssignments')) {
+                    $user->parkingAssignments()->delete();
+                }
+
+                $user->delete();
+            });
+
+            return $this->sendResponse([], 'User deleted successfully.');
+        } catch (\Throwable $th) {
+            return $this->sendError('Server Error.', $th->getMessage(), 500);
+        }
+    }
 }

@@ -12,11 +12,13 @@ class ParkingLayout extends Model
     protected $fillable = [
         'name',
         'background_image',
-        'layout_data'
+        'layout_data',
+        'is_active'
     ];
 
     protected $casts = [
         'layout_data' => 'json'  // Changed from 'array' to 'json' for better handling
+        , 'is_active' => 'boolean'
     ];
 
     /**

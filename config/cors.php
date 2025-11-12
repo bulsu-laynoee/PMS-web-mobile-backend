@@ -12,11 +12,14 @@ return [
     |
     */
 
-    'paths' => ['*'],
+
+    // Limit CORS paths to API and sanctum endpoints
+    'paths' => ['api/*', 'sanctum/csrf-cookie'],
 
     'allowed_methods' => ['*'],
 
-    'allowed_origins' => ['*'], // Temporarily allow all origins for debugging
+    // For security, list the frontend origin(s) explicitly when sending credentials
+    'allowed_origins' => [env('FRONTEND_URL', 'http://localhost:3000')],
 
     'allowed_origins_patterns' => [],
 

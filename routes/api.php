@@ -5,10 +5,16 @@ use App\Http\Controllers\API\UsersController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 
+// NOTE: Manual CORS headers and OPTIONS handling were removed here to
+// avoid duplicating headers set by the framework's HandleCors middleware.
+// CORS should be configured via `config/cors.php` and environment vars.
+
 use App\Http\Controllers\API\RegisterController;
 use App\Http\Controllers\API\ProductController;
 use App\Http\Controllers\API\TransactionController;
 use App\Http\Controllers\API\TreeController;
+use App\Http\Controllers\API\DashboardController;
+use App\Http\Controllers\API\SettingsController;
 
 // Add missing route for byLayout
 Route::get('parking-assignments/by-layout/{layoutId}', [App\Http\Controllers\API\ParkingAssignmentController::class, 'byLayout']);
@@ -16,6 +22,7 @@ use App\Http\Controllers\API\ParkingLayoutController;
 use App\Http\Controllers\API\ParkingAssignmentController;
 use App\Http\Controllers\FileController;
 use App\Http\Controllers\API\DatabaseTestController;
+use App\Http\Controllers\API\AnalyticsController;
 
 // Health check route (no authentication required)
 Route::get('/health', function () {
@@ -38,6 +45,24 @@ Route::get('/health', function () {
 | is assigned the "api" middleware group. Enjoy building your API!
 |
 */
+Route::prefix('account')->group(function () {
+        // GET /api/account (Reads the user's own profile)
+        Route::get('/', [SettingsController::class, 'profile']);
+
+        // POST /api/account/update-profile (For forms with file uploads)
+        // Laravel's middleware will treat this as a PATCH request because the
+        // frontend will send a `_method: "PATCH"` field.
+        Route::post('/update-profile', [SettingsController::class, 'updateProfile']);
+        
+        // PATCH /api/account/password (For changing password)
+        Route::patch('/password', [SettingsController::class, 'updatePassword']);
+
+        // DELETE /api/account (For deleting the user's own account)
+        Route::delete('/', [SettingsController::class, 'deleteAccount']);
+});
+
+Route::get('/dashboard-stats', [DashboardController::class, 'getDashboardStats']);
+
 
 // Public routes for serving images
 Route::get('image/{path}', [FileController::class, 'serveImage'])->where('path', '.*');
@@ -154,3 +179,8 @@ Route::get('qr/{filename}', [App\Http\Controllers\API\QRController::class, 'show
 // Fallback routes for file serving (in case storage:link fails on shared hosting)
 Route::get('storage/{path}', [App\Http\Controllers\API\FileStorageController::class, 'serveFile'])->where('path', '.*');
 Route::get('check-storage-link', [App\Http\Controllers\API\FileStorageController::class, 'checkStorageLink']);
+
+Route::middleware('auth:sanctum')->group(function () {
+    Route::get('/analytics/parking-stats', [AnalyticsController::class, 'getParkingAssignmentStats']);
+    Route::get('/analytics/driver-reports', [AnalyticsController::class, 'getDriverReportStats']);
+});

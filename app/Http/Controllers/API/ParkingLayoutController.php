@@ -4,403 +4,489 @@ namespace App\Http\Controllers\API;
 
 use App\Http\Controllers\Controller;
 use App\Models\ParkingLayout;
+use App\Models\ParkingSlot; // Import ParkingSlot if needed for slot logic
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\Rule;
+use Illuminate\Database\Eloquent\ModelNotFoundException;
+use Illuminate\Validation\ValidationException;
+use Illuminate\Support\Facades\Schema; // <-- Added this import
 
 class ParkingLayoutController extends Controller
 {
-    protected function getDatabaseErrorMessage(\Illuminate\Database\QueryException $e) {
-        $code = $e->getCode();
-        $message = $e->getMessage();
-        
-        // Common MySQL/PostgreSQL error codes
-        switch ($code) {
-            case '23000': // Integrity constraint violation
-                return 'Data integrity error: Duplicate entry or invalid reference';
-            case '42S22': // Column not found
-                return 'Database schema error: Missing column';
-            case '42S02': // Table not found
-                return 'Database schema error: Missing table';
-            default:
-                // Extract useful info from the generic message
-                if (strpos($message, "Column") !== false && strpos($message, "doesn't exist") !== false) {
-                    return 'Database schema error: Missing column';
-                }
-                return 'Database error: ' . $message;
-        }
+    /**
+     * Helper function for database error messages.
+     *
+     * @param \Illuminate\Database\QueryException $e
+     * @return string
+     */
+    protected function getDatabaseErrorMessage(\Illuminate\Database\QueryException $e): string
+    {
+         $code = $e->getCode();
+         $message = $e->getMessage();
+         switch ($code) {
+             case '23000': return 'Data integrity error: Duplicate entry or invalid reference';
+             case '42S22': return 'Database schema error: Missing column';
+             case '42S02': return 'Database schema error: Missing table';
+             default:
+                 if (str_contains($message, "Column") && str_contains($message, "doesn't exist")) {
+                     return 'Database schema error: Missing column';
+                 }
+                 return 'Database error: (' . $code . ') ' . $message; // Include code
+         }
     }
 
+    /**
+     * Display a listing of the resource.
+     * GET /api/parking-layouts
+     *
+     * @return \Illuminate\Http\JsonResponse
+     */
     public function index()
     {
         try {
-            $layouts = ParkingLayout::with('parkingSlots')->get();
+            // is_active included automatically via model
+            $layouts = ParkingLayout::with('parkingSlots')->orderBy('name')->get();
             return response()->json([
                 'message' => 'Layouts retrieved successfully',
                 'data' => $layouts
             ]);
         } catch (\Exception $e) {
-            Log::error('Error retrieving layouts: ' . $e->getMessage());
-            $response = [
-                'message' => 'Error retrieving layouts',
-                'error' => $e->getMessage(),
-            ];
-            if (config('app.debug')) {
-                $response['exception'] = get_class($e);
-                $response['trace'] = $e->getTrace();
-            }
-            return response()->json($response, 500);
+            Log::error('Error retrieving layouts: ' . $e->getMessage(), ['trace' => $e->getTraceAsString()]);
+            return response()->json(['message' => 'Error retrieving layouts', 'error' => config('app.debug') ? $e->getMessage() : 'Server error'], 500);
         }
     }
 
+    /**
+     * Display the specified resource.
+     * GET /api/parking-layouts/{id}
+     *
+     * @param int $id
+     * @return \Illuminate\Http\JsonResponse
+     */
     public function show($id)
     {
         try {
-            Log::info('Showing layout with ID: ' . $id);
-            
+            // is_active included automatically via model
             $layout = ParkingLayout::with('parkingSlots')->findOrFail($id);
-            
-            Log::info('Found layout:', ['layout' => $layout->toArray()]);
-            
-            // Parse layout_data from JSON if it's a string
-            $layoutData = is_string($layout->layout_data) ? 
-                json_decode($layout->layout_data, true) : 
-                $layout->layout_data;
 
-            Log::info('Parsed layout data:', ['layoutData' => $layoutData]);
+            // layout_data automatically decoded by 'array' cast
+            $layoutData = $layout->layout_data ?: [];
 
-            // Create the full response data structure
+            // Prepare response data consistently
             $responseData = [
                 'id' => $layout->id,
                 'name' => $layout->name,
-                'background_image' => $layout->background_image,
-                'parking_slots' => $layout->parkingSlots,  // Keep this for backwards compatibility
-                'layout_data' => $layoutData ?: [
-                    'parking_slots' => [],
-                    'lines' => [],
-                    'texts' => []
+                'description' => $layout->description,
+                'background_image' => $layout->background_image, // Uses accessor
+                'is_active' => $layout->is_active,
+                // parking_slots relation is already loaded via with()
+                'parking_slots' => $layout->parkingSlots,
+                'layout_data' => [ // Ensure structure
+                    'parking_slots' => $layoutData['parking_slots'] ?? [],
+                    'lines' => $layoutData['lines'] ?? [],
+                    'texts' => $layoutData['texts'] ?? []
                 ]
             ];
-
-            Log::info('Sending response:', ['responseData' => $responseData]);
 
             return response()->json([
                 'message' => 'Layout retrieved successfully',
                 'data' => $responseData
             ]);
+        } catch (ModelNotFoundException $e) {
+            Log::warning('Layout not found:', ['id' => $id]);
+            return response()->json(['message' => 'Layout not found'], 404);
         } catch (\Exception $e) {
-            Log::error('Error retrieving layout: ' . $e->getMessage());
-            $response = [
-                'message' => 'Error retrieving layout',
-                'error' => $e->getMessage(),
-            ];
-            if (config('app.debug')) {
-                $response['exception'] = get_class($e);
-                $response['trace'] = $e->getTrace();
-            }
-            return response()->json($response, 500);
+            Log::error('Error retrieving layout: ' . $e->getMessage(), ['id' => $id, 'trace' => $e->getTraceAsString()]);
+            return response()->json(['message' => 'Error retrieving layout', 'error' => config('app.debug') ? $e->getMessage() : 'Server error'], 500);
         }
     }
 
+    /**
+     * Store a newly created resource in storage.
+     * POST /api/parking-layouts
+     *
+     * @param \Illuminate\Http\Request $request
+     * @return \Illuminate\Http\JsonResponse
+     */
     public function store(Request $request)
     {
+        $validatedData = $request->validate([
+            'name' => 'required|string|max:255|unique:parking_layouts,name',
+            'description' => 'nullable|string',
+            'background_image' => 'nullable|image|mimes:jpeg,png,jpg,gif|max:2048',
+            // Validate structure if layout_data is provided. Accept either an already-decoded array
+            // (when the request's Content-Type is application/json) or a JSON string.
+            'layout_data' => ['nullable', function ($attribute, $value, $fail) {
+                if ($value === null) {
+                    return; // nullable allowed
+                }
+
+                if (is_array($value)) {
+                    $data = $value;
+                } elseif (is_string($value)) {
+                    $data = json_decode($value, true);
+                    if (json_last_error() !== JSON_ERROR_NONE) {
+                        $fail('The '.$attribute.' must be valid JSON.');
+                        return;
+                    }
+                } else {
+                    $fail('The '.$attribute.' must be a JSON string or an array.');
+                    return;
+                }
+
+                if (!is_array($data)) {
+                    $fail('The '.$attribute.' must decode to an array.');
+                }
+            }],
+        ]);
+
         DB::beginTransaction();
-
         try {
-            $request->validate([
-                'name' => 'required|string|max:255',
-                'background_image' => 'nullable|image|mimes:jpeg,png,jpg,gif|max:2048',
-                'layout_data' => 'required',
-            ]);
-
+            $imagePath = null;
             if ($request->hasFile('background_image')) {
-                $path = $request->file('background_image')->store('parking-layouts', 'public');
-                $path = asset('storage/' . $path);
+                // Store relative path
+                $imagePath = $request->file('background_image')->store('parking-layouts', 'public');
             }
 
-            // Handle layout data
-            if (is_string($request->layout_data)) {
-                $layoutData = json_decode($request->layout_data, true);
-                if (json_last_error() !== JSON_ERROR_NONE) {
-                    throw new \Exception('Invalid layout data format: ' . json_last_error_msg());
-                }
-            } else {
-                $layoutData = $request->layout_data;
+            $layoutData = null;
+            if ($request->filled('layout_data')) {
+                 $layoutDataInput = $request->input('layout_data');
+                 // Decode here since validation ensures it's valid JSON string or already array
+                 $layoutData = is_string($layoutDataInput) ? json_decode($layoutDataInput, true) : $layoutDataInput;
             }
 
-            // Ensure the layout data has the required structure
-            if (!is_array($layoutData)) {
-                throw new \Exception('Layout data must be an array');
-            }
-
-            // Store the complete layout data including slots
+            // Create the layout
             $layout = ParkingLayout::create([
-                'name' => $request->name,
-                'background_image' => $path ?? null,
-                'layout_data' => [
-                    'parking_slots' => $layoutData['parking_slots'] ?? [],
-                    'lines' => $layoutData['lines'] ?? [],
-                    'texts' => $layoutData['texts'] ?? []
-                ]
+                'name' => $validatedData['name'],
+                'description' => $validatedData['description'] ?? null,
+                'background_image' => $imagePath, // Store relative path
+                'is_active' => true, // Default to active
+                'layout_data' => $layoutData // Model's cast/mutator handles encoding
             ]);
 
-            // Also create the slots in the parking_slots table for tracking status
-            if (!empty($layoutData['parking_slots']) && is_array($layoutData['parking_slots'])) {
-                foreach ($layoutData['parking_slots'] as $slotData) {
-                    // Create the parking slot with all necessary data
-                    $slot = $layout->parkingSlots()->create([
-                        'space_number' => $slotData['space_number'] ?? ('Space ' . rand(1000, 9999)),
-                        'space_type' => $slotData['space_type'] ?? 'standard',
-                        'space_status' => $slotData['space_status'] ?? 'available',
-                        'position_x' => $slotData['x_coordinate'] ?? $slotData['position_x'] ?? 0,
-                        'position_y' => $slotData['y_coordinate'] ?? $slotData['position_y'] ?? 0,
-                        'width' => $slotData['width'] ?? 60,
-                        'height' => $slotData['height'] ?? 120,
-                        'rotation' => $slotData['rotation'] ?? 0,
-                        'metadata' => $slotData['metadata'] ?? [
-                            'fill' => $slotData['fill'] ?? null,
-                            'type' => $slotData['type'] ?? 'standard'
-                        ]
-                    ]);
-
-                    Log::info('Created parking slot:', [
-                        'layout_id' => $layout->id,
-                        'slot_id' => $slot->id,
-                        'data' => $slot->toArray()
-                    ]);
-                }
+            // Sync slots if layout_data was provided
+            if ($layoutData && isset($layoutData['parking_slots']) && is_array($layoutData['parking_slots'])) {
+                $this->syncParkingSlots($layout, $layoutData['parking_slots']);
             }
 
             DB::commit();
-
-            // Return the layout with its slots
+            // Load fresh data including the accessor for background_image URL
+            $layout->refresh()->load('parkingSlots');
             return response()->json([
                 'message' => 'Layout created successfully',
-                'data' => $layout->fresh('parkingSlots')
+                'data' => $layout
             ], 201);
 
-        } catch (\Exception $e) {
+        } catch (ValidationException $e) {
+             DB::rollBack();
+             Log::error('Validation error creating parking layout: ', ['errors' => $e->errors()]);
+             return response()->json(['message' => 'Validation failed', 'errors' => $e->errors()], 422);
+         } catch (\Exception $e) {
             DB::rollBack();
-            Log::error('Error creating parking layout: ' . $e->getMessage());
-            return response()->json([
-                'message' => 'Error creating parking layout',
-                'error' => $e->getMessage()
-            ], 500);
+            Log::error('Error creating parking layout: ' . $e->getMessage(), ['trace' => $e->getTraceAsString()]);
+            return response()->json(['message' => 'Error creating parking layout', 'error' => config('app.debug') ? $e->getMessage() : 'Server error'], 500);
         }
     }
 
+    /**
+     * Update the specified resource in storage.
+     * Handles both full updates and specific is_active toggles.
+     * PUT /api/parking-layouts/{id}
+     *
+     * @param \Illuminate\Http\Request $request
+     * @param int $id
+     * @return \Illuminate\Http\JsonResponse
+     */
     public function update(Request $request, $id)
     {
-        $parking_layout = ParkingLayout::findOrFail($id);
-        \Log::info('ParkingLayoutController@update: Found layout by id', ['layout_id' => $id]);
-        \Log::info('ParkingLayoutController@update: Request data', ['request_data' => $request->all()]);
+        Log::info("--- Starting Update Layout Request ---", ['id' => $id, 'request_data' => $request->all()]); // Log entry point
 
-        // Defensive: check if layout exists and id is set
-        if (!$parking_layout || !$parking_layout->id) {
-            \Log::error('ParkingLayoutController@update: Layout does not exist or id is null', ['layout' => $parking_layout]);
-            return response()->json(['message' => 'Layout does not exist'], 404);
-        }
-        \Log::info('ParkingLayoutController@update: Layout id', ['id' => $parking_layout->id]);
-        try {
-            DB::beginTransaction();
+        // --- Handle specific 'is_active' toggle request ---
+        // Check if ONLY 'is_active' is present in the request body
+        // Note: $request->all() might include '_method' if using form method spoofing, check count accordingly.
+        // If using raw PUT, $request->all() should only contain sent data.
+        $requestDataKeys = array_keys($request->all());
+        $isToggleOnly = count($requestDataKeys) === 1 && $requestDataKeys[0] === 'is_active';
 
-            Log::info('Starting layout update', [
-                'layout_id' => $parking_layout->id,
-                'request_data' => $request->all()
-            ]);
+        if ($isToggleOnly) {
+             Log::info("Processing as 'is_active' toggle only.");
+             $validatedData = $request->validate([
+                 'is_active' => ['required', Rule::in([true, false, 1, 0, '1', '0'])],
+             ]);
+             Log::info('Validation Passed (is_active toggle only).', ['validated_data' => $validatedData]);
 
-            Log::info('Current layout state:', [
-                'layout' => $parking_layout->toArray()
-            ]);
+             DB::beginTransaction();
+             try {
+                 $parking_layout = ParkingLayout::findOrFail($id);
+                 Log::info('Found layout for toggle.', ['id' => $id, 'current_is_active' => $parking_layout->is_active]);
 
-            $updatedSlotIds = [];
+                 $newStatus = filter_var($validatedData['is_active'], FILTER_VALIDATE_BOOLEAN);
+                 Log::info('Processing is_active toggle.', ['new_status' => $newStatus]);
 
-            if ($request->has('layout_data')) {
-                $layoutData = $request->input('layout_data');
-                if (is_string($layoutData)) {
-                    $decodedData = json_decode($layoutData, true);
-                    if (json_last_error() !== JSON_ERROR_NONE) {
-                        throw new \Exception('Invalid JSON in layout_data: ' . json_last_error_msg());
-                    }
-                    $layoutData = $decodedData;
-                }
-                if (!is_array($layoutData)) {
-                    throw new \Exception('layout_data must be an array');
-                }
+                 // Only save if the status actually changed
+                 if ($parking_layout->is_active !== $newStatus) {
+                     $parking_layout->is_active = $newStatus;
+                     Log::info('Attempting to save is_active status...');
+                     if ($parking_layout->save()) { // Use direct save() for this isolated update
+                         Log::info('is_active status saved successfully.');
+                     } else {
+                         Log::error('Model save() returned false for is_active update.');
+                         throw new \Exception('Failed to save layout status change.'); // Force error if save fails silently
+                     }
+                 } else {
+                     Log::info('is_active status unchanged, no save needed.');
+                 }
 
-                // Ensure the parking_layout exists and has an ID
-                if (!$parking_layout->exists || !$parking_layout->id) {
-                    throw new \Exception('Layout does not exist');
-                }
+                 DB::commit();
+                 Log::info('Transaction committed (is_active toggle).');
 
-                // First update the layout data itself
-                $parking_layout->layout_data = $layoutData;
-                $parking_layout->save(); // Save first to ensure we have an ID
-                
-                Log::info('Updating layout data:', [
-                    'layout_id' => $parking_layout->id,
-                    'new_data' => $parking_layout->layout_data
-                ]);
+                 $parking_layout->refresh()->load('parkingSlots'); // Get fresh data
+                 return response()->json([
+                     'message' => 'Layout status updated successfully',
+                     'data' => $parking_layout
+                 ]);
 
-                // --- SYNC PARKING SLOTS TABLE ---
-                $slotDataArr = $layoutData['parking_slots'] ?? [];
-                $existingSlots = $parking_layout->parkingSlots()->get()->keyBy('id');
-                foreach ($slotDataArr as $slotData) {
-                    // Try to match by id, else create new
-                    $slotId = isset($slotData['id']) ? $slotData['id'] : null;
-                    
-                    // Prepare metadata
-                    $metadata = array_merge($slotData['metadata'] ?? [], [
-                        'rotation' => $slotData['rotation'] ?? 0,
-                        'fill' => $slotData['fill'] ?? 'rgba(0, 255, 0, 0.3)',
-                        'type' => $slotData['space_type'] ?? 'standard',
-                        'name' => $slotData['space_number'] ?? ('Space ' . rand(1000, 9999))
-                    ]);
+             } catch (ModelNotFoundException $e) {
+                 DB::rollBack();
+                 Log::warning('Layout not found for toggle:', ['id' => $id]);
+                 return response()->json(['message' => 'Layout not found'], 404);
+            } catch (ValidationException $e) {
+                 DB::rollBack();
+                 Log::error('Validation error toggling layout status:', ['id' => $id, 'errors' => $e->errors()]);
+                 return response()->json(['message' => 'Validation failed', 'errors' => $e->errors()], 422);
+             } catch (\Exception $e) {
+                 DB::rollBack();
+                 Log::error('--- Error During Layout Toggle ---', [
+                     'id' => $id, 'message' => $e->getMessage(), 'trace' => $e->getTraceAsString()
+                 ]);
+                 return response()->json(['message' => 'Error updating layout status', 'error' => config('app.debug') ? $e->getMessage() : 'Server error'], 500);
+             }
 
-                    // Defensive: always set layout_id to current layout
-                    $slotArr = [
-                        'layout_id' => $parking_layout->id,
-                        'space_number' => $slotData['space_number'] ?? ('Space ' . rand(1000, 9999)),
-                        'space_type' => $slotData['space_type'] ?? 'standard',
-                        'space_status' => $slotData['space_status'] ?? 'available',
-                        'position_x' => $slotData['position_x'] ?? 0,
-                        'position_y' => $slotData['position_y'] ?? 0,
-                        'width' => $slotData['width'] ?? 60,
-                        'height' => $slotData['height'] ?? 120,
-                        'rotation' => $slotData['rotation'] ?? 0,
-                        'metadata' => $metadata
-                    ];
-                    Log::info('Saving parking slot:', ['slotArr' => $slotArr, 'slotId' => $slotId]);
-                    if ($slotId && $existingSlots->has($slotId)) {
-                        $slot = $existingSlots[$slotId];
-                        $slot->update($slotArr);
-                        $updatedSlotIds[] = $slot->id;
+        } else {
+             // --- Handle Full Update Request (if more than just is_active is sent) ---
+             Log::info('Processing as full layout update.');
+             $validatedData = $request->validate([
+                 'name' => 'sometimes|required|string|max:255|unique:parking_layouts,name,'.$id,
+                 'description' => 'sometimes|nullable|string',
+                 'background_image' => 'sometimes|nullable|image|mimes:jpeg,png,jpg,gif|max:2048',
+                 'is_active' => ['sometimes', 'required', Rule::in([true, false, 1, 0, '1', '0'])],
+                 'layout_data' => ['sometimes','nullable', function ($attribute, $value, $fail) {
+                      // Accept either a decoded array or a JSON string. Avoid calling json_decode on arrays.
+                      if ($value === null) { return; }
+                      if (is_array($value)) {
+                          $data = $value;
+                      } elseif (is_string($value)) {
+                          $data = json_decode($value, true);
+                          if (json_last_error() !== JSON_ERROR_NONE) { $fail('Invalid JSON.'); return; }
+                      } else {
+                          $fail('The '.$attribute.' must be a JSON string or an array.'); return;
+                      }
+
+                      if (!is_array($data)) { $fail('Must decode to an array.'); }
+                 }],
+             ]);
+             Log::info('Validation Passed (full update).', ['validated_data' => $validatedData]);
+
+             DB::beginTransaction();
+             try {
+                $parking_layout = ParkingLayout::findOrFail($id);
+                 Log::info('Found layout for full update.', ['id' => $id]);
+
+                 $updatePayload = []; // Collect fields to update
+
+                 // Build payload based on validated data present in the request
+                if (array_key_exists('is_active', $validatedData)) {
+                    $updatePayload['is_active'] = filter_var($validatedData['is_active'], FILTER_VALIDATE_BOOLEAN);
+                 }
+                 if (array_key_exists('name', $validatedData)) {
+                     $updatePayload['name'] = $validatedData['name'];
+                 }
+                // Check if description column exists before adding to payload
+                if (array_key_exists('description', $validatedData)) {
+                    // Check if the 'description' column actually exists on the table
+                    if (Schema::hasColumn('parking_layouts', 'description')) {
+                         $updatePayload['description'] = $validatedData['description'];
                     } else {
-                        $slot = $parking_layout->parkingSlots()->create($slotArr);
-                        $updatedSlotIds[] = $slot->id;
+                         Log::warning("Skipping description update: 'description' column does not exist on parking_layouts table.");
                     }
-                }
-                // Delete slots that are no longer present
-                $allSlotIds = $existingSlots->keys()->toArray();
-                $toDelete = array_diff($allSlotIds, $updatedSlotIds);
-                if (!empty($toDelete)) {
-                    $parking_layout->parkingSlots()->whereIn('id', $toDelete)->delete();
-                }
-                // --- END SYNC ---
-            }
+                 }
 
-            if ($request->has('name')) {
-                $parking_layout->name = $request->input('name');
-            }
+                // Image handling (using relative paths)
+                if ($request->hasFile('background_image')) {
+                     if ($oldImage = $parking_layout->getRawOriginal('background_image')) { Storage::disk('public')->delete($oldImage); }
+                     $imagePath = $request->file('background_image')->store('parking-layouts', 'public');
+                     $updatePayload['background_image'] = $imagePath; // Store relative path
+                     Log::info('Processing background image upload.');
+                 } elseif ($request->has('background_image') && $request->input('background_image') === null) {
+                      if ($oldImage = $parking_layout->getRawOriginal('background_image')) { Storage::disk('public')->delete($oldImage); }
+                     $updatePayload['background_image'] = null;
+                     Log::info('Processing background image removal.');
+                 }
 
-            if ($request->hasFile('background_image')) {
-                if ($parking_layout->background_image) {
-                    Storage::disk('public')->delete($parking_layout->background_image);
-                }
-                $path = $request->file('background_image')->store('parking-layouts', 'public');
-                $parking_layout->background_image = asset('storage/' . $path);
-            }
 
-            $parking_layout->save();
+                // Layout data handling
+                if (array_key_exists('layout_data', $validatedData)) {
+                     $layoutDataInput = $request->input('layout_data');
+                     $layoutData = null;
+                     if ($layoutDataInput !== null) { $layoutData = is_string($layoutDataInput) ? json_decode($layoutDataInput, true) : $layoutDataInput; }
+                     $updatePayload['layout_data'] = $layoutData; // Model handles encoding
+                     Log::info('Processing layout_data update and syncing slots.');
+                     $slotDataArr = $layoutData['parking_slots'] ?? [];
+                     $this->syncParkingSlots($parking_layout, $slotDataArr);
+                 }
 
-            DB::commit();
+                 // Perform mass update only if there are fields in the payload
+                if (!empty($updatePayload)) {
+                     Log::info('Attempting to mass update model...', ['payload_keys' => array_keys($updatePayload)]);
+                     if ($parking_layout->update($updatePayload)) { // Use update() for mass assignment
+                         Log::info('Model updated successfully via mass assignment.');
+                     } else {
+                         Log::error('Model update() returned false during full update.');
+                         throw new \Exception('Failed to update layout changes using mass assignment.');
+                     }
+                 } else {
+                     // Check if only layout_data (and thus slots) might have changed
+                     if (!array_key_exists('layout_data', $validatedData)) {
+                        Log::info('No eligible fields provided for layout update, skipping update().');
+                     } else {
+                        // If only layout_data was sent, syncSlots already happened.
+                        // We still might need to save if other parts of layout_data (lines/texts) changed.
+                        // However, updatePayload is empty, so we rely on syncSlots saving relationships.
+                        // If layout_data itself needs saving (e.g., lines/texts change),
+                        // we might need a direct save here if nothing else changed.
+                         if (!$request->hasFile('background_image') && !$request->has('background_image')) {
+                             // Consider if layout_data outside of slots needs saving
+                             // $parking_layout->save(); // Might be redundant if syncSlots saves parent
+                             Log::info('Only layout_data provided, slots synced.');
+                         }
+                     }
+                 }
 
-            return response()->json([
-                'message' => 'Layout updated successfully',
-                'data' => $parking_layout->fresh('parkingSlots')
-            ]);
 
-        } catch (\Exception $e) {
-            DB::rollBack();
-            Log::error('Error updating layout:', [
-                'message' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
-                'layout_id' => $parking_layout->id,
-                'request_data' => $request->all()
-            ]);
-            return response()->json([
-                'message' => 'Error updating layout',
-                'error' => $e->getMessage(),
-                'debug' => config('app.debug') ? [
-                    'trace' => $e->getTraceAsString(),
-                    'layout_id' => $parking_layout->id
-                ] : null
-            ], 500);
-        }
+                 DB::commit();
+                 Log::info('Transaction committed (full update).');
+
+                 $parking_layout->refresh()->load('parkingSlots');
+                 Log::info('Returning updated layout (full update).', ['id' => $id]);
+                 return response()->json(['message' => 'Layout updated successfully', 'data' => $parking_layout]);
+
+             } catch (ModelNotFoundException $e) {
+                 DB::rollBack(); Log::warning('Layout not found for update:', ['id' => $id]); return response()->json(['message' => 'Layout not found'], 404);
+             } catch (ValidationException $e) {
+                 DB::rollBack(); Log::error('Validation error updating layout:', ['id' => $id, 'errors' => $e->errors()]); return response()->json(['message' => 'Validation failed', 'errors' => $e->errors()], 422);
+             } catch (\Exception $e) {
+                 DB::rollBack();
+                 Log::error('--- Error During Full Layout Update ---', [
+                     'id' => $id, 'message' => $e->getMessage(), 'trace' => $e->getTraceAsString()
+                 ]);
+                 return response()->json(['message' => 'Error updating layout', 'error' => config('app.debug') ? $e->getMessage() : 'Server error'], 500);
+             }
+         }
     }
 
+
+    /**
+     * Remove the specified resource from storage.
+     * DELETE /api/parking-layouts/{id}
+     *
+     * @param int $id
+     * @return \Illuminate\Http\JsonResponse
+     */
     public function destroy($id)
     {
         DB::beginTransaction();
         try {
             $layout = ParkingLayout::findOrFail($id);
-            
-            // Log more details about the deletion attempt
-            Log::info('Attempting to delete layout:', [
-                'layout_id' => $layout->id,
-                'layout_exists' => $layout->exists,
-                'layout_data' => $layout->toArray()
-            ]);
+            Log::info('Attempting to delete layout:', ['layout_id' => $id]);
 
-            // Verify the layout exists in the database
-            if (!$layout->exists) {
-                throw new \Exception('Layout does not exist in database');
-            }
+            // Delete associated parking slots first explicitly to ensure deletion
+            // This is safer than relying solely on potential DB cascade settings
+            Log::info('Deleting associated parking slots for layout:', ['layout_id' => $id]);
+            $layout->parkingSlots()->delete();
 
-            // Double check that we can find it in the database
-            $verifyLayout = ParkingLayout::find($layout->id);
-            if (!$verifyLayout) {
-                throw new \Exception('Layout not found in database during verification');
-            }
+            // Delete the background image
+            if ($imagePath = $layout->getRawOriginal('background_image')) {
+                 if (Storage::disk('public')->exists($imagePath)) {
+                     Storage::disk('public')->delete($imagePath);
+                     Log::info('Deleted background image', ['path' => $imagePath]);
+                 } else {
+                     Log::warning('Background image file not found for deletion:', ['path' => $imagePath]);
+                 }
+             }
 
-            // First, delete all associated parking slots using raw SQL to ensure it executes
-            $slotsDeleted = DB::table('parking_slots')
-                ->where('layout_id', $layout->id)
-                ->delete();
-            Log::info('Deleted associated parking slots:', ['count' => $slotsDeleted]);
-
-            // Delete the background image if it exists
-            if ($layout->background_image) {
-                // Extract the file path from the full URL
-                $path = str_replace(asset('storage/'), '', $layout->background_image);
-                if (Storage::disk('public')->exists($path)) {
-                    Storage::disk('public')->delete($path);
-                    Log::info('Deleted background image:', ['path' => $path]);
-                }
-            }
-            
-            // Delete the layout using raw SQL to ensure it executes
-            $deleted = DB::table('parking_layouts')
-                ->where('id', $layout->id)
-                ->delete();
-            
-            if (!$deleted) {
-                throw new \Exception('Failed to delete layout from database');
-            }
-
-            Log::info('Successfully deleted layout:', [
-                'layout_id' => $layout->id,
-                'rows_deleted' => $deleted
-            ]);
-            
+            $layout->delete(); // Delete the layout record
+            Log::info('Successfully deleted layout', ['layout_id' => $id]);
             DB::commit();
-            
-            return response()->json([
-                'message' => 'Layout and all associated data deleted successfully'
-            ], 200);
+            return response()->json(['message' => 'Layout deleted successfully'], 200);
+
+        } catch (ModelNotFoundException $e) {
+             DB::rollBack();
+             Log::warning('Attempted to delete non-existent layout:', ['layout_id' => $id]);
+             return response()->json(['message' => 'Layout not found'], 404);
         } catch (\Exception $e) {
             DB::rollBack();
-            Log::error('Error deleting layout:', [
-                'layout_id' => $layout->id,
-                'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString()
-            ]);
-            return response()->json([
-                'message' => 'Error deleting layout',
-                'error' => $e->getMessage()
-            ], 500);
+            Log::error('Error deleting layout:', ['id' => $id, 'error' => $e->getMessage(), 'trace' => $e->getTraceAsString()]);
+            // Check for foreign key constraint errors specifically
+            if ($e instanceof \Illuminate\Database\QueryException && str_contains($e->getMessage(), 'constraint violation')) {
+                // You might have assignments referencing slots in this layout
+                return response()->json(['message' => 'Cannot delete layout: It may still have active parking assignments. Please end all assignments for this layout first.', 'error' => config('app.debug') ? $e->getMessage() : 'Constraint violation'], 409); // 409 Conflict
+            }
+            return response()->json(['message' => 'Error deleting layout', 'error' => config('app.debug') ? $e->getMessage() : 'Server error'], 500);
         }
     }
-}
 
+     /**
+      * Helper function to sync parking slots based on layout data.
+      *
+      * @param ParkingLayout $parking_layout
+      * @param array $slotDataArr Data containing the parking slots from the request
+      * @return void
+      */
+     protected function syncParkingSlots(ParkingLayout $parking_layout, array $slotDataArr)
+     {
+         $existingSlots = $parking_layout->parkingSlots()->pluck('id', 'id'); // More efficient way to get existing IDs
+         $processedSlotIds = [];
+
+         foreach ($slotDataArr as $slotData) {
+             $slotId = $slotData['id'] ?? null;
+
+             $metadata = [ // Simplified metadata structure based on ParkingSlot model
+                 'rotation' => $slotData['rotation'] ?? ($slotData['metadata']['rotation'] ?? 0),
+                 'fill' => $slotData['fill'] ?? ($slotData['metadata']['fill'] ?? 'rgba(0, 255, 0, 0.3)'),
+                 'type' => $slotData['space_type'] ?? ($slotData['metadata']['type'] ?? 'standard'),
+                 'name' => $slotData['space_number'] ?? ($slotData['metadata']['name'] ?? ('Slot ' . substr(uniqid(), -4)))
+             ];
+
+             $slotArr = [
+                 'space_number' => $slotData['space_number'] ?? ('Slot ' . substr(uniqid(), -4)),
+                 'space_type' => $slotData['space_type'] ?? 'standard',
+                 // Preserve existing status only if updating and not provided
+                 'space_status' => $slotData['space_status'] ?? ($existingSlots->has($slotId) ? $parking_layout->parkingSlots()->find($slotId)->space_status : 'available'),
+                 'position_x' => $slotData['position_x'] ?? $slotData['x_coordinate'] ?? 0,
+                 'position_y' => $slotData['position_y'] ?? $slotData['y_coordinate'] ?? 0,
+                 'width' => $slotData['width'] ?? 60,
+                 'height' => $slotData['height'] ?? 120,
+                 'rotation' => $slotData['rotation'] ?? 0,
+                 'metadata' => $metadata // Model will encode this
+             ];
+
+             // Use updateOrCreate with layout relationship for automatic layout_id
+             $slot = $parking_layout->parkingSlots()->updateOrCreate(
+                 ['id' => $slotId], // Search criteria (null ID means create)
+                 $slotArr          // Data
+             );
+             $processedSlotIds[$slot->id] = true; // Mark ID as processed
+         }
+
+         // Delete slots that existed before but were not in the processed list
+         $slotIdsToDelete = $existingSlots->keys()->diff(array_keys($processedSlotIds))->all();
+         if (!empty($slotIdsToDelete)) {
+             Log::info('Deleting parking slots no longer present in layout_data update', ['ids' => $slotIdsToDelete]);
+             ParkingSlot::whereIn('id', $slotIdsToDelete)->where('layout_id', $parking_layout->id)->delete();
+         }
+         Log::info('Parking slot sync complete', ['layout_id' => $parking_layout->id, 'processed_count' => count($processedSlotIds), 'deleted_count' => count($slotIdsToDelete)]);
+     }
+}
