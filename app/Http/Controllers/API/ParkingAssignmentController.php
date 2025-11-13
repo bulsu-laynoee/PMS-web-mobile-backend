@@ -13,9 +13,11 @@ use Illuminate\Support\Facades\Validator;
 use Illuminate\Validation\Rule; // <-- Make sure this is imported
 use App\Notifications\ParkingAssignedNotification;
 use App\Events\ParkingSlotStatusChanged;
-use App\Services\AdminNotifier;
 use Illuminate\Validation\ValidationException;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
+use Illuminate\Support\Facades\Schema;
+use App\Models\UserDetails;
+use Carbon\Carbon;
 
 class ParkingAssignmentController extends Controller
 {
@@ -111,6 +113,114 @@ class ParkingAssignmentController extends Controller
         $validatedData = $validator->validated(); // Get validated data
         Log::info('ParkingAssignment validation passed.', $validatedData);
 
+        // --- SECURITY: Require valid QR scan token when assigning on behalf of a user ---
+        if (!empty($validatedData['user_id'])) {
+            // Robust token extraction: recursively inspect request input for a 64-hex token or query param 't'/'token'.
+            $providedToken = null;
+
+            $findTokenRecursive = function ($val) use (&$findTokenRecursive) {
+                // token format: SHA-256 hex (64 chars)
+                $hexPattern = '/\b[0-9a-f]{64}\b/i';
+
+                if (is_array($val)) {
+                    foreach ($val as $k => $v) {
+                        // direct key matches
+                        if (in_array(strtolower($k), ['t','token','qr_token','scan_token','scanToken','qrToken'])) {
+                            if (!empty($v)) return (string)$v;
+                        }
+                        $found = $findTokenRecursive($v);
+                        if ($found) return $found;
+                    }
+                    return null;
+                }
+
+                if (is_string($val)) {
+                    $s = trim($val);
+                    // raw token match
+                    if (preg_match($hexPattern, $s, $m)) return (string)$m[0];
+
+                    // if value is a URL, try parsing query params
+                    if (filter_var($s, FILTER_VALIDATE_URL)) {
+                        $parts = parse_url($s);
+                        if (!empty($parts['query'])) { parse_str($parts['query'], $qs); if (!empty($qs['t'])) return (string)$qs['t']; if (!empty($qs['token'])) return (string)$qs['token']; }
+                    }
+
+                    // attempt to extract from string like 't=..' or 'token=..'
+                    parse_str($s, $qs2);
+                    if (!empty($qs2['t'])) return (string)$qs2['t']; if (!empty($qs2['token'])) return (string)$qs2['token'];
+
+                    return null;
+                }
+
+                return null;
+            };
+
+            // Inspect request inputs first
+            try {
+                $providedToken = $findTokenRecursive($request->all());
+            } catch (\Throwable $e) {
+                // fall back to direct fields
+                $providedToken = $request->input('scan_token') ?? $request->input('token') ?? $request->input('qr_token') ?? null;
+            }
+
+            // fallback to header
+            if (! $providedToken && $request->header('X-QR-Token')) { $providedToken = $request->header('X-QR-Token'); }
+
+            // Normalize token: decode, trim, extract from URL/query if needed
+            if ($providedToken) {
+                try {
+                    $providedToken = trim(urldecode((string)$providedToken));
+                    if (filter_var($providedToken, FILTER_VALIDATE_URL)) {
+                        $parts = parse_url($providedToken);
+                        if (!empty($parts['query'])) { parse_str($parts['query'], $qs); if (!empty($qs['t'])) $providedToken = (string)$qs['t']; elseif (!empty($qs['token'])) $providedToken = (string)$qs['token']; }
+                    } else {
+                        if (strpos($providedToken, 't=') !== false || strpos($providedToken, 'token=') !== false) { parse_str($providedToken, $qs2); if (!empty($qs2['t'])) $providedToken = (string)$qs2['t']; elseif (!empty($qs2['token'])) $providedToken = (string)$qs2['token']; }
+                    }
+                } catch (\Throwable $e) {
+                    // ignore normalization errors
+                }
+            }
+
+             $requestingUser = $request->user();
+            Log::info('Resolved providedToken for assignment', ['user_id' => $validatedData['user_id'], 'providedTokenPresent' => $providedToken ? true : false, 'providedPreview' => $providedToken ? substr($providedToken,0,16) : null]);
+
+             // If the request is not performed by the same user, require a scan token
+             if (! $requestingUser || intval($requestingUser->id) !== intval($validatedData['user_id'])) {
+                 if (! $providedToken) {
+                     Log::warning('Rejecting assignment: missing scan token for user assignment', ['user_id' => $validatedData['user_id'], 'request_body_preview' => array_slice($request->all(), 0, 10)]);
+                     return response()->json(['message' => 'Missing scan token for user assignment'], 403);
+                 }
+             }
+
+             // If token provided, validate it against stored user_details
+             if ($providedToken) {
+                 $ud = UserDetails::where('user_id', $validatedData['user_id'])->first();
+                // log compare previews for debugging
+                try { Log::info('Comparing provided token with stored token', ['user_id'=>$validatedData['user_id'], 'provided_preview'=>substr((string)$providedToken,0,16), 'stored_preview'=> $ud && $ud->qr_token ? substr((string)$ud->qr_token,0,16) : null]); } catch (\Throwable $e) {}
+                 if (! $ud || empty($ud->qr_token) || !hash_equals((string)$ud->qr_token, (string)$providedToken)) {
+                     // best-effort: mark qr_is_active false if present to reflect invalidation
+                     try { if ($ud && Schema::hasColumn('user_details', 'qr_is_active')) { $ud->qr_is_active = 0; $ud->save(); } } catch (\Throwable $e) { /* ignore */ }
+                     Log::warning('Rejecting assignment: invalid scan token', ['user_id' => $validatedData['user_id']]);
+                     return response()->json(['message' => 'Token not recognized'], 404);
+                 }
+                
+                // check expiry
+                if (Schema::hasColumn('user_details', 'qr_expires_at') && $ud->qr_expires_at) {
+                    try {
+                        $expires = Carbon::parse($ud->qr_expires_at);
+                        if ($expires->isPast()) {
+                            // mark inactive
+                            try { if (Schema::hasColumn('user_details', 'qr_is_active')) { $ud->qr_is_active = 0; $ud->save(); } } catch (\Throwable $e) { /* ignore */ }
+                            Log::warning('Rejecting assignment: scan token expired', ['user_id' => $validatedData['user_id']]);
+                            return response()->json(['message' => 'Token expired', 'expired' => true], 410);
+                        }
+                    } catch (\Throwable $e) {
+                        // ignore parse errors
+                    }
+                }
+            }
+        }
+
         DB::beginTransaction();
         try {
             $slot = ParkingSlot::with('layout')->findOrFail($validatedData['parking_slot_id']);
@@ -189,11 +299,10 @@ class ParkingAssignmentController extends Controller
                 if ($assignment->user_id && ($user = User::find($assignment->user_id))) {
                     $user->notify(new ParkingAssignedNotification($assignment->load('parkingSlot.layout', 'user')));
                 }
-            } catch (\Exception $e) { \Log::warning('Failed assign notification: ' . $e->getMessage()); }
-            try { event(new ParkingSlotStatusChanged($assignment->load('parkingSlot.layout', 'user'))); }
-            catch (\Exception $e) { \Log::warning('Failed status event: ' . $e->getMessage()); }
+            } catch (\Exception $e) { Log::warning('Failed assign notification: ' . $e->getMessage()); }
+            try { event(new ParkingSlotStatusChanged($assignment->load('parkingSlot.layout', 'user'))); } catch (\Exception $e) { Log::warning('Failed status event: ' . $e->getMessage()); }
             // try { AdminNotifier::notifyAdmins([/*...*/]); }
-            // catch (\Exception $e) { \Log::warning('Failed admin notification: '.$e->getMessage()); }
+            // catch (\Exception $e) { Log::warning('Failed admin notification: '.$e->getMessage()); }
 
             return response()->json([
                 'message' => 'Parking assignment created successfully',
@@ -356,7 +465,7 @@ class ParkingAssignmentController extends Controller
                  else { Log::warning('Ended assignment but another active/reserved exists', ['ended_id' => $assignment->id, 'slot_id' => $slot->id, 'other_id' => $otherAssignment->id]); }
             } else if ($slot) { Log::warning('Ended assignment for already available slot?', ['assign_id' => $assignment->id, 'slot_id' => $slot->id]); }
             DB::commit();
-            try { event(new ParkingSlotStatusChanged($assignment->load('parkingSlot.layout', 'user'))); } catch (\Exception $e) { \Log::warning('End status event fail: ' . $e->getMessage()); }
+            try { event(new ParkingSlotStatusChanged($assignment->load('parkingSlot.layout', 'user'))); } catch (\Exception $e) { Log::warning('End status event fail: ' . $e->getMessage()); }
             $this->notifyAdminsAssignmentEnded($assignment);
             return response()->json(['message' => 'Assignment ended successfully', 'assignment' => $assignment->load('parkingSlot.layout', 'user')]);
         } catch (\Exception $e) { DB::rollBack(); Log::error('Error ending assignment', ['id' => $assignment->id, 'error' => $e->getMessage()]); return response()->json(['message' => 'Error ending assignment', 'error' => $e->getMessage()], 500); }
@@ -366,8 +475,9 @@ class ParkingAssignmentController extends Controller
     protected function notifyAdminsAssignmentEnded(ParkingAssignment $assignment)
     {
         try {
-            if (class_exists(AdminNotifier::class)) {
-                AdminNotifier::notifyAdmins([
+            $notifierClass = 'App\\Services\\AdminNotifier';
+            if (class_exists($notifierClass)) {
+                $notifierClass::notifyAdmins([
                     'type' => 'parking_assignment_ended',
                     'message' => 'A parking assignment has ended',
                     'assignment_id' => $assignment->id,
@@ -376,10 +486,10 @@ class ParkingAssignmentController extends Controller
                     'ended_at' => now()->toDateTimeString(),
                 ]);
             } else {
-                 Log::warning('AdminNotifier service class not found.');
+                Log::warning('AdminNotifier service class not found.');
             }
         } catch (\Exception $e) {
-            \Log::warning('Failed to notify admins about ended assignment: '.$e->getMessage());
+            Log::warning('Failed to notify admins about ended assignment: '.$e->getMessage());
         }
     }
 

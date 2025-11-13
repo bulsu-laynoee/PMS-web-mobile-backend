@@ -45,21 +45,21 @@ class QRController extends Controller
 
         // Determine payload
         $payload = $request->input('payload');
+
+        // We'll create a token for generated QR codes. If the caller provided a custom payload
+        // we will not inject the token into the payload, but we will still create an internal
+        // token and expiry so the app can use verification behavior consistently when desired.
+        $token = hash('sha256', $user->id . '|' . now()->timestamp . '|' . Str::random(8));
+        $expiresAt = now()->addMinutes(3); // 3 minute expiry
+
         if (! $payload) {
             // Default payload: a simple internal scan URL containing a short token
-            $token = hash('sha256', $user->id . '|' . now()->timestamp . '|' . Str::random(8));
-            // Build a payload URL containing the token. We prefer to return
-            // the payload to the caller rather than relying on storing the
-            // token in the database because some installations may not have
-            // `qr_token` or `qr_path` columns.
             $payload = url("/api/scan/qr?user={$user->id}&t={$token}");
         }
 
-        // We'll request an SVG QR from QuickChart which supports SVG output
-        // This keeps output in SVG format which the mobile app expects and can handle.
-    $filename = 'qr_' . $user->id . '_' . time() . '.svg';
-    // Store QR files under 'qrs/' directory as requested
-    $relativePath = 'qrs/' . $filename;
+        $filename = 'qr_' . $user->id . '_' . time() . '.svg';
+        // Store QR files under 'qrs/' directory as requested
+        $relativePath = 'qrs/' . $filename;
 
         // Generate SVG locally using endroid/qr-code so we don't depend on
         // external services. This produces an SVG string which we persist
@@ -79,7 +79,7 @@ class QRController extends Controller
             // Save to storage/app/public/qrs/
             Storage::disk('public')->put($relativePath, $contents);
 
-            // Attempt to persist the QR path (and token) to user_details only
+            // Attempt to persist the QR path (token and expiry) to user_details only
             // if the columns exist. If the DB schema doesn't have these
             // columns we'll skip the update but still return the payload so
             // the client can use it immediately.
@@ -91,6 +91,15 @@ class QRController extends Controller
                 }
                 if (Schema::hasColumn('user_details', 'qr_token')) {
                     $details->qr_token = $token;
+                    $needsSave = true;
+                }
+                if (Schema::hasColumn('user_details', 'qr_expires_at')) {
+                    // Store as MySQL datetime string
+                    $details->qr_expires_at = $expiresAt;
+                    $needsSave = true;
+                }
+                if (Schema::hasColumn('user_details', 'qr_is_active')) {
+                    $details->qr_is_active = 1;
                     $needsSave = true;
                 }
                 if ($needsSave) {
@@ -108,6 +117,9 @@ class QRController extends Controller
                 'path' => $relativePath,
                 'url' => $publicUrl,
                 'payload' => $payload,
+                'token' => $token,
+                // Use ISO8601 with timezone info so clients interpret expiry consistently
+                'expires_at' => $expiresAt->toIso8601String(),
             ], 201);
         } catch (\Exception $e) {
             return response()->json(['message' => 'QR generation failed', 'error' => $e->getMessage()], 500);
@@ -137,8 +149,36 @@ class QRController extends Controller
             if (isset($u['query'])) {
                 parse_str($u['query'], $qs);
                 if (isset($qs['user'])) {
-                    $user = User::find($qs['user']);
-                    $payload = $qs;
+                    // If a token (t) is present in the URL, validate it against stored user_details
+                    if (isset($qs['t'])) {
+                        $ud = UserDetails::where('user_id', $qs['user'])->first();
+                        if (! $ud) {
+                            return response()->json(['message' => 'Token not recognized'], 404);
+                        }
+
+                        // Ensure token matches
+                        if (! isset($ud->qr_token) || $ud->qr_token !== $qs['t']) {
+                            return response()->json(['message' => 'Token not recognized'], 404);
+                        }
+
+                        // Check expiry if available
+                        if (Schema::hasColumn('user_details', 'qr_expires_at') && $ud->qr_expires_at) {
+                            try {
+                                $expires = \Carbon\Carbon::parse($ud->qr_expires_at);
+                                if ($expires->isPast()) {
+                                    return response()->json(['message' => 'Token expired', 'expired' => true], 410);
+                                }
+                            } catch (\Throwable $e) {
+                                // ignore parse errors and continue
+                            }
+                        }
+
+                        $user = User::find($qs['user']);
+                        $payload = $qs;
+                    } else {
+                        // If URL does not include the token param, treat as invalid token
+                        return response()->json(['message' => 'Token not recognized'], 404);
+                    }
                 }
             }
         } catch (\Throwable $e) {
@@ -149,6 +189,18 @@ class QRController extends Controller
         if (! $user) {
             $ud = UserDetails::where('qr_token', $token)->first();
             if ($ud) {
+                // check expiry if present
+                if (Schema::hasColumn('user_details', 'qr_expires_at') && $ud->qr_expires_at) {
+                    try {
+                        $expires = \Carbon\Carbon::parse($ud->qr_expires_at);
+                        if ($expires->isPast()) {
+                            return response()->json(['message' => 'Token expired', 'expired' => true], 410);
+                        }
+                    } catch (\Throwable $e) {
+                        // ignore parse errors
+                    }
+                }
+
                 $user = User::find($ud->user_id);
                 $payload = ['user' => $ud->user_id, 'token' => $token];
             }

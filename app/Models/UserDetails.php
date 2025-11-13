@@ -21,10 +21,15 @@ class UserDetails extends Model
         'or_number',
         'cr_number',
         'from_pending',
+        // QR metadata
+        'qr_path', 'qr_token', 'qr_expires_at', 'qr_is_active',
     ];
 
     protected $casts = [
         'plate_numbers' => 'array',
+        // Ensure QR expiry and active flag are properly cast
+        'qr_expires_at' => 'datetime',
+        'qr_is_active' => 'boolean',
     ];
 
     public function vehicles()
