@@ -113,6 +113,9 @@ class ParkingAssignmentController extends Controller
         $validatedData = $validator->validated(); // Get validated data
         Log::info('ParkingAssignment validation passed.', $validatedData);
 
+        // Prepare a holder for a token that will be invalidated after successful assignment
+        $tokenToConsume = null;
+
         // --- SECURITY: Require valid QR scan token when assigning on behalf of a user ---
         if (!empty($validatedData['user_id'])) {
             // Robust token extraction: recursively inspect request input for a 64-hex token or query param 't'/'token'.
@@ -120,7 +123,7 @@ class ParkingAssignmentController extends Controller
 
             $findTokenRecursive = function ($val) use (&$findTokenRecursive) {
                 // token format: SHA-256 hex (64 chars)
-                $hexPattern = '/\b[0-9a-f]{64}\b/i';
+                $hexPattern = '/\\b[0-9a-f]{64}\\b/i';
 
                 if (is_array($val)) {
                     foreach ($val as $k => $v) {
@@ -184,6 +187,9 @@ class ParkingAssignmentController extends Controller
              $requestingUser = $request->user();
             Log::info('Resolved providedToken for assignment', ['user_id' => $validatedData['user_id'], 'providedTokenPresent' => $providedToken ? true : false, 'providedPreview' => $providedToken ? substr($providedToken,0,16) : null]);
 
+            // remember token so we can consume it after successful assignment
+            $tokenToConsume = $providedToken ?? null;
+
              // If the request is not performed by the same user, require a scan token
              if (! $requestingUser || intval($requestingUser->id) !== intval($validatedData['user_id'])) {
                  if (! $providedToken) {
@@ -198,27 +204,16 @@ class ParkingAssignmentController extends Controller
                 // log compare previews for debugging
                 try { Log::info('Comparing provided token with stored token', ['user_id'=>$validatedData['user_id'], 'provided_preview'=>substr((string)$providedToken,0,16), 'stored_preview'=> $ud && $ud->qr_token ? substr((string)$ud->qr_token,0,16) : null]); } catch (\Throwable $e) {}
                  if (! $ud || empty($ud->qr_token) || !hash_equals((string)$ud->qr_token, (string)$providedToken)) {
-                     // best-effort: mark qr_is_active false if present to reflect invalidation
-                     try { if ($ud && Schema::hasColumn('user_details', 'qr_is_active')) { $ud->qr_is_active = 0; $ud->save(); } } catch (\Throwable $e) { /* ignore */ }
+                     // Do NOT modify stored token state on mismatch. Reject the request and
+                     // allow clients to re-scan/regenerate as needed. Token consumption
+                     // happens only after a successful assignment commit.
                      Log::warning('Rejecting assignment: invalid scan token', ['user_id' => $validatedData['user_id']]);
                      return response()->json(['message' => 'Token not recognized'], 404);
                  }
-                
-                // check expiry
-                if (Schema::hasColumn('user_details', 'qr_expires_at') && $ud->qr_expires_at) {
-                    try {
-                        $expires = Carbon::parse($ud->qr_expires_at);
-                        if ($expires->isPast()) {
-                            // mark inactive
-                            try { if (Schema::hasColumn('user_details', 'qr_is_active')) { $ud->qr_is_active = 0; $ud->save(); } } catch (\Throwable $e) { /* ignore */ }
-                            Log::warning('Rejecting assignment: scan token expired', ['user_id' => $validatedData['user_id']]);
-                            return response()->json(['message' => 'Token expired', 'expired' => true], 410);
-                        }
-                    } catch (\Throwable $e) {
-                        // ignore parse errors
-                    }
-                }
-            }
+
+                 // NOTE: Do not check time-based expiry here. QR tokens are single-use
+                 // and are invalidated only after a successful parking assignment.
+             }
         }
 
         DB::beginTransaction();
@@ -293,6 +288,30 @@ class ParkingAssignmentController extends Controller
 
             DB::commit();
             Log::info('Transaction committed.');
+
+            // If a token was supplied for this assignment, invalidate it now that assignment succeeded
+            if (!empty($tokenToConsume) && !empty($validatedData['user_id'])) {
+                try {
+                    $udToConsume = UserDetails::where('user_id', $validatedData['user_id'])->first();
+                    if ($udToConsume && !empty($udToConsume->qr_token) && hash_equals((string)$udToConsume->qr_token, (string)$tokenToConsume)) {
+                        if (Schema::hasColumn('user_details', 'qr_is_active')) {
+                            $udToConsume->qr_is_active = 0;
+                        } else {
+                            if (Schema::hasColumn('user_details', 'qr_token')) {
+                                $udToConsume->qr_token = null;
+                            }
+                        }
+                        if (method_exists($udToConsume, 'save')) {
+                            $udToConsume->save();
+                        }
+                        Log::info('Consumed QR token after assignment', ['user_id' => $validatedData['user_id']]);
+                    } else {
+                        Log::warning('Token to consume not found or mismatch after assignment', ['user_id' => $validatedData['user_id']]);
+                    }
+                } catch (\Throwable $e) {
+                    Log::warning('Failed to consume QR token after assignment: ' . $e->getMessage());
+                }
+            }
 
             // Notifications and Events
             try {

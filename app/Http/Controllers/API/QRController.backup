@@ -48,9 +48,10 @@ class QRController extends Controller
 
         // We'll create a token for generated QR codes. If the caller provided a custom payload
         // we will not inject the token into the payload, but we will still create an internal
-        // token so the app can use verification behavior consistently when desired.
+        // token and expiry so the app can use verification behavior consistently when desired.
         $token = hash('sha256', $user->id . '|' . now()->timestamp . '|' . Str::random(8));
-        // No time-based expiry: QR is single-use and will be invalidated on first scan.
+        // 1 hour expiry (clients can display a countdown using expires_in seconds)
+        $expiresAt = now()->addHour();
 
         if (! $payload) {
             // Default payload: a simple internal scan URL containing a short token
@@ -79,9 +80,10 @@ class QRController extends Controller
             // Save to storage/app/public/qrs/
             Storage::disk('public')->put($relativePath, $contents);
 
-            // Attempt to persist the QR path (token and metadata) to user_details only
-            // if the columns exist. We will NOT set a time-based expiry here. The QR
-            // becomes invalid only after it is scanned (single-use behavior).
+            // Attempt to persist the QR path (token and expiry) to user_details only
+            // if the columns exist. If the DB schema doesn't have these
+            // columns we'll skip the update but still return the payload so
+            // the client can use it immediately.
             try {
                 $needsSave = false;
                 if (Schema::hasColumn('user_details', 'qr_path')) {
@@ -90,6 +92,11 @@ class QRController extends Controller
                 }
                 if (Schema::hasColumn('user_details', 'qr_token')) {
                     $details->qr_token = $token;
+                    $needsSave = true;
+                }
+                if (Schema::hasColumn('user_details', 'qr_expires_at')) {
+                    // Store as MySQL datetime string so verification parsing is reliable
+                    $details->qr_expires_at = $expiresAt->toDateTimeString();
                     $needsSave = true;
                 }
                 if (Schema::hasColumn('user_details', 'qr_is_active')) {
@@ -112,7 +119,10 @@ class QRController extends Controller
                 'url' => $publicUrl,
                 'payload' => $payload,
                 'token' => $token,
-                // Single-use: token will be invalidated on first successful scan.
+                // Use ISO8601 with timezone info so clients interpret expiry consistently
+                'expires_at' => $expiresAt->toIso8601String(),
+                // seconds until expiry (useful for client countdown timers)
+                'expires_in' => $expiresAt->diffInSeconds(now()),
             ], 201);
         } catch (\Exception $e) {
             return response()->json(['message' => 'QR generation failed', 'error' => $e->getMessage()], 500);
@@ -154,18 +164,20 @@ class QRController extends Controller
                             return response()->json(['message' => 'Token not recognized'], 404);
                         }
 
-                        // If there's a qr_is_active column, ensure token hasn't already been used
-                        if (Schema::hasColumn('user_details', 'qr_is_active') && isset($ud->qr_is_active) && intval($ud->qr_is_active) === 0) {
-                            return response()->json(['message' => 'Token already used', 'expired' => true], 410);
+                        // Check expiry if available
+                        if (Schema::hasColumn('user_details', 'qr_expires_at') && $ud->qr_expires_at) {
+                            try {
+                                $expires = \Carbon\Carbon::parse($ud->qr_expires_at);
+                                if ($expires->isPast()) {
+                                    return response()->json(['message' => 'Token expired', 'expired' => true], 410);
+                                }
+                            } catch (\Throwable $e) {
+                                // ignore parse errors and continue
+                            }
                         }
 
                         $user = User::find($qs['user']);
                         $payload = $qs;
-
-                        // IMPORTANT: do not consume the token here. Token should be consumed
-                        // only after successful parking assignment. A separate endpoint
-                        // `consume()` is provided below to be called by the parking-assignment
-                        // flow when the assignment is complete.
                     } else {
                         // If URL does not include the token param, treat as invalid token
                         return response()->json(['message' => 'Token not recognized'], 404);
@@ -180,17 +192,20 @@ class QRController extends Controller
         if (! $user) {
             $ud = UserDetails::where('qr_token', $token)->first();
             if ($ud) {
-                // If there's a qr_is_active column, ensure token hasn't already been used
-                if (Schema::hasColumn('user_details', 'qr_is_active') && isset($ud->qr_is_active) && intval($ud->qr_is_active) === 0) {
-                    return response()->json(['message' => 'Token already used', 'expired' => true], 410);
+                // check expiry if present
+                if (Schema::hasColumn('user_details', 'qr_expires_at') && $ud->qr_expires_at) {
+                    try {
+                        $expires = \Carbon\Carbon::parse($ud->qr_expires_at);
+                        if ($expires->isPast()) {
+                            return response()->json(['message' => 'Token expired', 'expired' => true], 410);
+                        }
+                    } catch (\Throwable $e) {
+                        // ignore parse errors
+                    }
                 }
 
                 $user = User::find($ud->user_id);
                 $payload = ['user' => $ud->user_id, 'token' => $token];
-
-                // IMPORTANT: do not consume the token here. Token is consumed only after
-                // successful parking assignment. Call QRController::consume from the
-                // parking-assignment controller when assignment succeeds.
             }
         }
 
@@ -215,64 +230,6 @@ class QRController extends Controller
                 'vehicles' => $vehicles,
             ]
         ]);
-    }
-
-    /**
-     * Consume (invalidate) a QR token. Intended to be called after a successful
-     * parking assignment so the QR becomes unusable afterwards.
-     * POST /api/qr/consume
-     * Body: { token: string }
-     */
-    public function consume(Request $request)
-    {
-        $token = $request->input('token');
-        if (! $token) {
-            return response()->json(['message' => 'Missing token'], 400);
-        }
-
-        // Support both URL-style tokens and raw tokens
-        $ud = null;
-        try {
-            $u = parse_url($token);
-            if (isset($u['query'])) {
-                parse_str($u['query'], $qs);
-                if (isset($qs['user']) && isset($qs['t'])) {
-                    $ud = UserDetails::where('user_id', $qs['user'])->first();
-                    if ($ud && isset($ud->qr_token) && $ud->qr_token === $qs['t']) {
-                        // found
-                    } else {
-                        $ud = null;
-                    }
-                }
-            }
-        } catch (\Throwable $e) {
-            // ignore
-        }
-
-        if (! $ud) {
-            $ud = UserDetails::where('qr_token', $token)->first();
-        }
-
-        if (! $ud) {
-            return response()->json(['message' => 'Token not recognized'], 404);
-        }
-
-        try {
-            if (Schema::hasColumn('user_details', 'qr_is_active')) {
-                $ud->qr_is_active = 0;
-            } else {
-                if (Schema::hasColumn('user_details', 'qr_token')) {
-                    $ud->qr_token = null;
-                }
-            }
-            if (method_exists($ud, 'save')) {
-                $ud->save();
-            }
-        } catch (\Throwable $e) {
-            // ignore write failures
-        }
-
-        return response()->json(['message' => 'Token consumed'], 200);
     }
 
     /**

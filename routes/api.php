@@ -107,8 +107,7 @@ Route::middleware('auth:sanctum')->group( function () {
     Route::delete('settings', [App\Http\Controllers\API\SettingsController::class, 'deleteAccount']);
     Route::resource('users', UsersController::class);
     Route::resource('products', ProductController::class);
-    Route::resource('transactions', TransactionController::class);
-    Route::resource('stores', StoreController::class);
+
         // QR generation for a user (admin or auth-required)
         Route::post('users/{id}/qr', [App\Http\Controllers\API\QRController::class, 'generate']);
     Route::prefix('parking-layouts')->group(function() {
@@ -135,9 +134,7 @@ Route::middleware('auth:sanctum')->group( function () {
     // Fetch users by role id (mobile will use this to load Admin and Guard contacts)
     Route::get('users/role/{roleId}', [App\Http\Controllers\API\UsersController::class, 'byRole']);
     
-    // Route::resource('trees', TreeController::class);
-    Route::get('/trees', [TreeController::class, 'index']);
-    Route::get('/trees/{lead}', [TreeController::class, 'show']);
+
 
     // Admin account creation endpoints (require admin role)
     Route::middleware('is_admin')->group(function() {

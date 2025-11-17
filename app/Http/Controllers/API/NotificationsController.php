@@ -4,6 +4,7 @@ namespace App\Http\Controllers\API;
 
 use App\Http\Controllers\Controller;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 
 class NotificationsController extends Controller
 {
@@ -18,8 +19,37 @@ class NotificationsController extends Controller
         // return the appropriate rows for the authenticated user.
         try {
             if (\Illuminate\Support\Facades\Schema::hasColumn('notifications', 'notifiable_type')) {
-                $notes = $user->notifications()->orderBy('created_at', 'desc')->limit(100)->get();
-                return response()->json(['data' => $notes]);
+                // Primary source: notifications explicitly addressed to this user
+                $notes = $user->notifications()->orderBy('created_at', 'desc')->limit(100)->get()->toArray();
+
+                // Also include notifications that mention this user inside the JSON payload
+                // (e.g. incident_reported where data.reported_user_id == $user->id)
+                // Use a loose LIKE search on the JSON to support a variety of DB engines.
+                $likePattern1 = '%"reported_user_id":' . $user->id . '%';
+                $likePattern2 = '%"reported_user_id":"' . $user->id . '"%';
+
+                $mentions = DB::table('notifications')
+                    ->where(function ($q) use ($user, $likePattern1, $likePattern2) {
+                        $q->where('data', 'like', $likePattern1)
+                          ->orWhere('data', 'like', $likePattern2);
+                    })
+                    ->orderBy('created_at', 'desc')
+                    ->limit(100)
+                    ->get()
+                    ->toArray();
+
+                // Merge unique by id (notes may already contain some of these)
+                $all = [];
+                $seen = [];
+                foreach (array_merge($notes, $mentions) as $n) {
+                    $id = is_object($n) ? ($n->id ?? null) : ($n['id'] ?? null);
+                    if ($id && !isset($seen[$id])) {
+                        $seen[$id] = true;
+                        $all[] = $n;
+                    }
+                }
+
+                return response()->json(['data' => array_values($all)]);
             }
         } catch (\Exception $e) {
             // fall through to legacy path
@@ -43,10 +73,29 @@ class NotificationsController extends Controller
 
         try {
             if (\Illuminate\Support\Facades\Schema::hasColumn('notifications', 'notifiable_type')) {
+                // Try the normal polymorphic path first (notification addressed to this user)
                 $note = $user->notifications()->where('id', $id)->first();
-                if (!$note) return response()->json(['message' => 'Not found'], 404);
-                $note->markAsRead();
-                return response()->json(['message' => 'Marked read']);
+                if ($note) {
+                    $note->markAsRead();
+                    return response()->json(['message' => 'Marked read']);
+                }
+
+                // If not found, the notification may still mention this user in the payload
+                // (e.g. incident_reported where data.reported_user_id == $user->id). Update the
+                // notifications table row directly in that case.
+                $updated = DB::table('notifications')
+                    ->where('id', $id)
+                    ->where(function ($q) use ($user) {
+                        $q->where('notifiable_id', $user->id)
+                          ->orWhere('user_id', $user->id)
+                          ->orWhere('data', 'like', '%"reported_user_id":' . $user->id . '%')
+                          ->orWhere('data', 'like', '%"reported_user_id":"' . $user->id . '"%');
+                    })
+                    ->update(['read_at' => now(), 'updated_at' => now()]);
+
+                if ($updated) return response()->json(['message' => 'Marked read']);
+
+                return response()->json(['message' => 'Not found'], 404);
             }
         } catch (\Exception $e) {
             // fall through to legacy path

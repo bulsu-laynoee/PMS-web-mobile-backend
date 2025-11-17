@@ -7,7 +7,7 @@ use Illuminate\Database\Eloquent\Model;
 class Incident extends Model
 {
     protected $fillable = [
-        'user_id', 'title', 'description', 'type', 'severity', 'location', 'status', 'meta', 'resolved_by', 'resolved_at'
+        'user_id', 'title', 'description', 'type', 'severity', 'location', 'status', 'meta', 'resolved_by', 'resolved_at', 'reported_user_id'
     ];
 
     protected $casts = [
@@ -28,5 +28,11 @@ class Incident extends Model
     public function resolver()
     {
         return $this->belongsTo(User::class, 'resolved_by');
+    }
+
+    // user that was reported (involved in the incident)
+    public function reportedUser()
+    {
+        return $this->belongsTo(User::class, 'reported_user_id');
     }
 }
